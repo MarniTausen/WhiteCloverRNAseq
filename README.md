@@ -1,13 +1,22 @@
 White Clover RNAseq supplementary scripts
 ================
-28/09/2020 - 10:37:09
+28/09/2020 - 11:41:19
 
 -   [Introduction](#introduction)
+-   [RNA mapping and variant calling](#rna-mapping-and-variant-calling)
+    -   [Add readgroups to BAM files](#add-readgroups-to-bam-files)
+    -   [Mark duplicates and correct quality](#mark-duplicates-and-correct-quality)
+    -   [SplitNTrim RNA reads](#splitntrim-rna-reads)
 
 Introduction
 ============
 
-This document lists the scripts and workflows/pipelines used for performing mapping and variant calling on white clover RNAseq data. Each step of the process has its own section and code in the correct order it was run. \#RNA mapping and variant calling Read mapping of the RNAseq data. The workflow script is a gwf pipeline (<http://gwf.readthedocs.io/en/latest/>), which keeps track of all job dependencies and submits the scripts in the correct order.
+This document lists the scripts and workflows/pipelines used for performing mapping and variant calling on white clover RNAseq data. Each step of the process has its own section and code in the correct order it was run.
+
+RNA mapping and variant calling
+===============================
+
+Read mapping of the RNAseq data. The workflow script is a gwf pipeline (<http://gwf.readthedocs.io/en/latest/>), which keeps track of all job dependencies and submits the scripts in the correct order.
 
 ``` python
 from gwf import Workflow
@@ -353,4 +362,55 @@ gwf.target_from_template("GATKfiltervariants",
 #gwf.target_from_template("GATKfiltervariants",
 #                         FilterVariants("RNAseq_unfiltered_variants.vcf",
 #                                        "RNAseq_variants.vcf"))
+```
+
+Add readgroups to BAM files
+---------------------------
+
+Using picard to add read groups. Usage: ./picard.sh <in_bam_file> <out_bam_file> <read group>. Used to append read groups to the bam files after read mapping with STAR is done. This step is required for GATK to process the reads.
+
+``` bash
+#!/bin/bash
+
+source /com/extra/picard/2.0.1/load.sh
+source /com/extra/java/8/load.sh
+
+picard AddOrReplaceReadGroups INPUT=$1 OUTPUT=$2 SO=coordinate RGID=$3 RGLB=library1 RGPL=illumina RGPU=H0164ALXX140820.2 RGSM=$3 
+```
+
+Mark duplicates and correct quality
+-----------------------------------
+
+Usage: ./markduplicates.sh <in_bam_file> <out_bam_file>. Mark any duplicate reads, however main usage is for the process to correct mapping quality used by STAR and standardizing it for usage with GATK.
+
+``` bash
+#!/bin/bash
+
+source /com/extra/picard/2.0.1/load.sh
+source /com/extra/java/8/load.sh
+
+picard MarkDuplicates I=$1 O=$2 CREATE_INDEX=true VALIDATION_STRINGENCY=SILENT M=output.metric 
+```
+
+SplitNTrim RNA reads
+--------------------
+
+Usage: ./SplitNTrim.sh <in_bam_file> <out_bam_file>. Fixes RNA reads and prepares them for input to GATK.
+
+``` bash
+#!/bin/bash
+
+source /com/extra/java/8/load.sh
+source /com/extra/GATK/3.6/load.sh
+
+java -Xmx64g -Djava.io.tmpdir=./gtak_tmp -jar /com/extra/GATK/3.6/jar-bin/GenomeAnalysisTK.jar \
+     -T SplitNCigarReads \
+     -I $1 \
+     -o $2 \
+     -rf ReassignOneMappingQuality \
+     -RMQF 255 \
+     -RMQT 60 \
+     -R /home/marnit/NChain/faststorage/WHITE_CLOVER/SofieWhiteClover/references/TrR/TrR.v5.fasta \
+     -U ALLOW_N_CIGAR_READS \
+     2>&1
 ```
