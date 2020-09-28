@@ -1,12 +1,16 @@
 White Clover RNAseq supplementary scripts
 ================
-28/09/2020 - 11:41:19
+28/09/2020 - 14:17:41
 
 -   [Introduction](#introduction)
 -   [RNA mapping and variant calling](#rna-mapping-and-variant-calling)
     -   [Add readgroups to BAM files](#add-readgroups-to-bam-files)
     -   [Mark duplicates and correct quality](#mark-duplicates-and-correct-quality)
     -   [SplitNTrim RNA reads](#splitntrim-rna-reads)
+    -   [Variant calling (Unifiedgenotyper)](#variant-calling-unifiedgenotyper)
+    -   [Variant calling (HaplotypeCaller)](#variant-calling-haplotypecaller)
+    -   [Variant calling (HaplotypeCallerGVCF)](#variant-calling-haplotypecallergvcf)
+    -   [FilterVariants](#filtervariants)
 
 Introduction
 ============
@@ -413,4 +417,99 @@ java -Xmx64g -Djava.io.tmpdir=./gtak_tmp -jar /com/extra/GATK/3.6/jar-bin/Genome
      -R /home/marnit/NChain/faststorage/WHITE_CLOVER/SofieWhiteClover/references/TrR/TrR.v5.fasta \
      -U ALLOW_N_CIGAR_READS \
      2>&1
+```
+
+Variant calling (Unifiedgenotyper)
+----------------------------------
+
+Usage: ./Unifiedgenotyper.sh <bamlist>
+<output vcf file>
+. Uses the Unifiedgenotyper from GATK to do variant calling.
+
+``` bash
+#!/bin/bash
+
+source /com/extra/java/8/load.sh
+source /com/extra/GATK/3.6/load.sh
+
+java -Xmx64g -jar /com/extra/GATK/3.6/jar-bin/GenomeAnalysisTK.jar \
+     -T UnifiedGenotyper \
+     -I $1 \
+     -o $2 \
+     -stand_call_conf 50 \
+     -stand_emit_conf 20.0 \
+     --sample_ploidy 2 \
+     -nct 12 --genotyping_mode DISCOVERY \
+     -R /home/marnit/NChain/faststorage/WHITE_CLOVER/SofieWhiteClover/references/TrR/TrR.v5.fasta \
+     --output_mode EMIT_ALL_CONFIDENT_SITES \
+     -rf BadCigar 2>&1 > log
+```
+
+Variant calling (HaplotypeCaller)
+---------------------------------
+
+Usage: ./HaplotypeCaller.sh <bamlist>
+<output vcf file>
+. Uses the HaplotypeCaller from GATK to do variant calling (this is recommended caller when using RNAseq data).
+
+``` bash
+#!/bin/bash
+
+source /com/extra/java/8/load.sh
+source /com/extra/GATK/3.6/load.sh
+
+java -Xmx64g -jar GATK/version3.8/GenomeAnalysisTK.jar \
+     -T HaplotypeCaller \
+     -I $1 \
+     -o $2 \
+     -stand_call_conf 20.0 \
+     -dontUseSoftClippedBases \
+     -nct 16 \
+     -R /home/marnit/NChain/faststorage/WHITE_CLOVER/SofieWhiteClover/references/TrR/TrR.v5.fasta \
+     2>&1 > log
+```
+
+Variant calling (HaplotypeCallerGVCF)
+-------------------------------------
+
+Usage: ./HaplotypeCallerGVCF.sh <bamlist>
+<output vcf file>
+. Uses the HaplotypeCaller from GATK to do variant calling, but produces a gvcf file instead which outputs all callable sites. This is useful when performing variant calling on each individual separately when parallelizing the workflow. In the case of more than 80+ individuals, this is required due to the resource requirements when doing variant calling on all of the individuals at the same time.
+
+``` bash
+#!/bin/bash
+
+source /com/extra/java/8/load.sh
+source /com/extra/GATK/3.6/load.sh
+
+java -Xmx64g -jar GATK/version3.8/GenomeAnalysisTK.jar \
+     -T HaplotypeCaller \
+     -I $1 \
+     -o $2 \
+     -stand_call_conf 20.0 \
+     -dontUseSoftClippedBases \
+     --emitRefConfidence GVCF \
+     -nct $3 \
+     -R /home/marnit/NChain/faststorage/WHITE_CLOVER/SofieWhiteClover/references/TrR/TrR.v5.fasta \
+     2>&1 > log
+```
+
+FilterVariants
+--------------
+
+Usage: ./Selectvariantsall.sh <bamlist>
+<output vcf file>
+. Filter variants using the Selectvariants command in GATK. Settings are limited to basic quality checks, and a depth filter based on the amount of individuals in the variant calling.
+
+``` bash
+#!/bin/bash
+
+source /com/extra/java/8/load.sh
+
+java -Xmx64g -jar GATK/version3.8/GenomeAnalysisTK.jar \
+     -R /home/marnit/NChain/faststorage/WHITE_CLOVER/SofieWhiteClover/references/TrR/TrR.v5.fasta \
+     -T SelectVariants \
+     -o $2 \
+     --variant $1 \
+     --restrictAllelesTo ALL -select "MQ>30.00 && DP>160 && QUAL>20.00"
 ```
