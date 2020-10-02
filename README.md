@@ -1,16 +1,21 @@
 White Clover RNAseq supplementary scripts
 ================
-28/09/2020 - 14:17:41
+02/10/2020 - 16:13:35
 
 -   [Introduction](#introduction)
 -   [RNA mapping and variant calling](#rna-mapping-and-variant-calling)
     -   [Add readgroups to BAM files](#add-readgroups-to-bam-files)
     -   [Mark duplicates and correct quality](#mark-duplicates-and-correct-quality)
+    -   [Fix the SAM file reference header](#fix-the-sam-file-reference-header)
     -   [SplitNTrim RNA reads](#splitntrim-rna-reads)
     -   [Variant calling (Unifiedgenotyper)](#variant-calling-unifiedgenotyper)
     -   [Variant calling (HaplotypeCaller)](#variant-calling-haplotypecaller)
     -   [Variant calling (HaplotypeCallerGVCF)](#variant-calling-haplotypecallergvcf)
     -   [FilterVariants](#filtervariants)
+-   [VCF Utilities](#vcf-utilities)
+    -   [VCF filter using reference individual](#vcf-filter-using-reference-individual)
+    -   [VCF rename columns](#vcf-rename-columns)
+    -   [VCF to Genotype Matrix](#vcf-to-genotype-matrix)
 
 Introduction
 ============
@@ -396,6 +401,33 @@ source /com/extra/java/8/load.sh
 picard MarkDuplicates I=$1 O=$2 CREATE_INDEX=true VALIDATION_STRINGENCY=SILENT M=output.metric 
 ```
 
+Fix the SAM file reference header
+---------------------------------
+
+Usage: pipe in samfile | python sam\_reference\_fix.py &gt; output.sam. Sam files produced by STAR add a 1 to the reference header in the samfiles. Samfiles passed through this script fix the header by substracting the 1 again in the header and simply output the sam file out again.
+
+``` bash
+import sys
+#import os
+#rom stat import S_IS
+
+def fix(line):
+    if "@SQ\t" in line:
+        split_line = line.split("\t")
+        length = split_line[2]
+        length = length.split(":")
+        length[1] = int(length[1])
+        length[1] -= 1
+        length[1] = str(length[1])
+        split_line[2] = ":".join(length)
+        return "\t".join(split_line)+"\n"
+    return line
+
+if __name__=="__main__":
+    for line in sys.stdin:
+        print(fix(line), end="")
+```
+
 SplitNTrim RNA reads
 --------------------
 
@@ -497,7 +529,7 @@ java -Xmx64g -jar GATK/version3.8/GenomeAnalysisTK.jar \
 FilterVariants
 --------------
 
-Usage: ./Selectvariantsall.sh <bamlist>
+Usage: ./Selectvariantsall.sh <bam list>
 <output vcf file>
 . Filter variants using the Selectvariants command in GATK. Settings are limited to basic quality checks, and a depth filter based on the amount of individuals in the variant calling.
 
@@ -512,4 +544,423 @@ java -Xmx64g -jar GATK/version3.8/GenomeAnalysisTK.jar \
      -o $2 \
      --variant $1 \
      --restrictAllelesTo ALL -select "MQ>30.00 && DP>160 && QUAL>20.00"
+```
+
+VCF Utilities
+=============
+
+The main VCF script used by the other minor functions. It contains VCF class that makes processing and reading a VCF file in python easier. When reading through the file it provides a dictionary from each line, making it easy to lookup specific information from this SNP or from the individuals. It also provides a list of all of the names of the individuals in the VCF file.
+
+``` python
+from optparse import OptionParser
+import sys
+import os
+class VCF:
+    def __init__(self, filename):
+        self._file = open(filename)
+        self._empty = False
+        self.read_header()
+        self.find_pairs()
+    def read_header(self):
+        self.header_info = ""
+        while True:
+            self._last_line = self._file.tell()
+            line = self._file.readline()
+            if line[:2]=="##":
+                self.header_info += line
+                continue
+            if line[0]=="#":
+                self.header = {}
+                self.revheader = {}
+                #self.header_info += line
+                line = line.replace("\n","")
+                for i, name in enumerate(line[1:].split("\t")):
+                    self.header[name] = i
+                    self.revheader[i] = name
+                continue
+            self._file.seek(self._last_line)
+            break
+    def find_pairs(self):
+        exclude = ["CHROM", "POS", "ID", "REF", "ALT", "QUAL",
+                   "FILTER", "INFO", "FORMAT"]
+        self.individuals = []
+        self.individual_pair = {}
+        for name in self.header:
+            if name in exclude: continue
+            if ":" in name:
+                true_name = name.split(":")[-1]
+                self.individual_pair[true_name] = self.header[name]
+                continue
+            self.individuals.append(name)
+    def readline(self):
+        if self._empty: return None, ''
+        line = self._file.readline()
+        if line=='':
+            self._empty = True
+            return None, ''
+        sline = line.split("\t")
+        sline[-1] = sline[-1].replace("\n", "")
+        elements = {}
+        for i, column in enumerate(sline):
+            elements[self.revheader[i]] = column
+        return elements, line
+    def __iter__(self):
+        return self
+    def __next__(self):
+        return self.readline()
+def clean(genotype):
+    return (genotype[0], genotype[2])
+if __name__=='__main__':
+    usage = '''
+    usage: python \033[4m%prog\033[24m \033[38;5;74m[options]\033[39m \033[32m<vcf file>\033[39m'''
+    parser = OptionParser(usage)
+    parser.add_option('-o', type="string", nargs=1, dest="Output", default="output.csv",
+                      help="Output file name. Default: output.csv")
+    options, args = parser.parse_args()
+```
+
+VCF filter using reference individual
+-------------------------------------
+
+VCF filter script used to filter by the reference white clover individual S9. The variant calling was done by including sequencing from the white clover individual used from the genome assembly. The script filters any sites where the S9 individual is not homozygous reference, as it should not have any variants compared to the reference. The sites inwhich a variant is found is then filtered as it is an error, and likely a highly variable site.
+
+``` python
+from optparse import OptionParser
+import sys
+import os
+class VCF:
+    def __init__(self, filename):
+        self._file = open(filename)
+        self._empty = False
+        self.read_header()
+        self.find_pairs()
+    def read_header(self):
+        self.header_info = ""
+        while True:
+            self._last_line = self._file.tell()
+            line = self._file.readline()
+            if line[:2]=="##":
+                self.header_info += line
+                continue
+            if line[0]=="#":
+                self.header = {}
+                self.revheader = {}
+                self.header_info += line
+                line = line.replace("\n","")
+                for i, name in enumerate(line[1:].split("\t")):
+                    self.header[name] = i
+                    self.revheader[i] = name
+                continue
+            self._file.seek(self._last_line)
+            break
+    def find_pairs(self):
+        exclude = ["CHROM", "POS", "ID", "REF", "ALT", "QUAL",
+                   "FILTER", "INFO", "FORMAT"]
+        self.individuals = []
+        self.individual_pair = {}
+        for name in self.header:
+            if name in exclude: continue
+            if ":" in name:
+                true_name = name.split(":")[-1]
+                self.individual_pair[true_name] = self.header[name]
+                continue
+            self.individuals.append(name)
+    def readline(self):
+        if self._empty: return None, ''
+        line = self._file.readline()
+        if line=='':
+            self._empty = True
+            return None, ''
+        sline = line.split("\t")
+        sline[-1] = sline[-1].replace("\n", "")
+        elements = {}
+        for i, column in enumerate(sline):
+            elements[self.revheader[i]] = column
+        return elements, line
+    def __iter__(self):
+        return self
+    def __next__(self):
+        return self.readline()
+def clean(genotype):
+    return (genotype[0], genotype[2])
+if __name__=='__main__':
+    usage = '''
+    usage: python \033[4m%prog\033[24m \033[38;5;74m[options]\033[39m \033[32m<vcf file>\033[39m'''
+    parser = OptionParser(usage)
+    options, args = parser.parse_args()
+    if args==[]:
+        raise Exception("No vcf file was included. Please provide a vcf file as the first argument")
+    VCF_file = VCF(args[0])
+    sys.stdout.write(VCF_file.header_info)
+    no_genotype = (".", ".")
+    for info, line in VCF_file:
+        if info is None: break
+        genotype = info['S9'].split(":")[0]
+        #if genotype!='0/0' and genotype!='./.': continue
+        if genotype!='0/0': continue
+        sys.stdout.write(line)
+```
+
+VCF rename columns
+------------------
+
+Script for renaming the individual columns using an ID map file.
+
+``` python
+from VCF import VCF
+from optparse import OptionParser
+def IDmap_read(filename):
+    if filename==None: raise Exception("Invalid filename. Please provide an IDmap file.")
+    f = open(filename)
+    header = f.readline().replace("\n", "").replace("\r", "").split(";")
+    header[0] = header[0].replace("\ufeff", "")
+    RNAtoVariety = {}
+    GBStoVariety = {}
+    for line in f:
+        line = line.replace("\n", "").replace("\r", "")
+        line = {name: value for name, value in zip(header, line.split(";"))}
+        GBStoVariety[line['GBS']] = line['Variety']
+        if line["RNA"]=='': continue
+        if "," in line["RNA"]:
+            samples = line["RNA"].split(",")
+            for sample in samples:
+                RNAtoVariety[sample] = line['Variety']
+            continue
+        RNAtoVariety[line["RNA"]] = line['Variety']
+    return GBStoVariety, RNAtoVariety
+def get_genotype(genotype):
+    return genotype.split(":")[0]
+def convert_genotype(genotype):
+    if genotype=="./.": return "NA"
+    g1, g2 = genotype.split("/")
+    return str(int(g1)+int(g2))
+def collect_elements(elements, columns):
+    output_row = []
+    missing_counter = 0
+    for name in columns:
+        if name=="CHROM" or name=="POS":
+            output_row.append(elements[name])
+            continue
+        genotype = convert_genotype(get_genotype(elements[name]))
+        output_row.append(genotype)
+        if genotype=="NA":
+            missing_counter += 1
+    return output_row, missing_counter
+if __name__=="__main__":
+    usage = '''
+    usage: python \033[4m%prog\033[24m \033[38;5;74m[options]\033[39m \033[32m<vcf file 1> <vcf file 2>\033[39m'''
+    parser = OptionParser(usage)
+    parser.add_option('-o', type="string", nargs=1, dest="output", default="output.csv",
+                      help="Output file name. Default: output.csv")
+    parser.add_option('--ID', type="string", nargs=1, dest="IDmap",
+                      help="ID map file Default: IDmap.csv")
+    parser.add_option('--VCF', type="string", nargs=1, dest="VCF",
+                      help="Input vcf file")
+    options, args = parser.parse_args()
+    IDmap = options.IDmap
+    VCF_filename = options.VCF
+    output = options.output
+    if IDmap==None: raise Exception("Please provide a IDmap file with --ID filename")
+    GBStoVariety, RNAtoVariety = IDmap_read(IDmap)
+    #if GBS==None: raise Exception("Please provide a GBS vcf file with --GBS filename")
+    if VCF_filename==None: raise Exception("Please provide a vcf file with --VCF filename")
+    VCF_file = VCF(VCF_filename)
+    print(VCF_file.individuals)
+    print(len(VCF_file.individuals))
+    new_individual_names = []
+    for rna_name, trans_name in zip(VCF_file.individuals, map(lambda x: RNAtoVariety.get(x, "SKIP"), VCF_file.individuals)):
+        if trans_name=="SKIP": continue
+        if trans_name in new_individual_names:
+            continue
+        new_individual_names.append(trans_name)
+        i = VCF_file.header[rna_name]
+        VCF_file.revheader[i] = trans_name
+        del VCF_file.header[rna_name]
+        VCF_file.header[trans_name] = i
+    VCF_file.individuals = new_individual_names
+    print(VCF_file.individuals)
+    print(len(VCF_file.individuals))
+    columns = [VCF_file.revheader[i] for i in range(0, len(VCF_file.revheader))]
+    ## Find common genotypes between files, and set order of VCF file.
+    #name_columns = VCF_file.individuals
+    #standard_columns = ["CHROM", "POS"]
+    #output_column_names = ["chromosome", "position"]
+    #columns = standard_columns+sorted(name_columns)
+    #out_columns = output_column_names+sorted(name_columns)
+    print(columns)
+    out_file = open(output, "w")
+    out_file.write(VCF_file.header_info)
+    out_file.write("#")
+    out_file.write("\t".join(columns))
+    out_file.write("\n")
+    ## Initialize file reading
+    VCFline = VCF_file.readline()
+    SNPs_removed = 0
+    SNPs_added = 0
+    ## Iteratively read RNA and GBS file in order of SNPs
+    while not VCF_file._empty:
+        elements, line = VCFline
+        out_file.write(line)
+        VCFline = VCF_file.readline()
+        if VCFline[0] is None: continue
+    out_file.close()
+```
+
+VCF to Genotype Matrix
+----------------------
+
+Main script from converting a VCF file into a simple Genotype Matrix file (.csv). Using an IDmap.csv file the names of the individuals are translated. The missingness filter is set here and applied by setting the --missingness option.
+
+``` python
+from VCF import VCF
+from optparse import OptionParser
+def IDmap_read(filename):
+    if filename==None: raise Exception("Invalid filename. Please provide an IDmap file.")
+    f = open(filename)
+    header = f.readline().replace("\n", "").replace("\r", "").split(";")
+    header[0] = header[0].replace("\ufeff", "")
+    RNAtoVariety = {}
+    GBStoVariety = {}
+    VarietytoRNA = {}
+    for line in f:
+        line = line.replace("\n", "").replace("\r", "")
+        line = {name: value for name, value in zip(header, line.split(";"))}
+        GBStoVariety[line['GBS']] = line['Variety']
+        if line["RNA"]=='': continue
+        if "," in line["RNA"]:
+            samples = line["RNA"].split(",")
+            VarietytoRNA[line['Variety']] = samples
+            for sample in samples:
+                RNAtoVariety[sample] = line['Variety']
+            continue
+        RNAtoVariety[line["RNA"]] = line['Variety']
+        VarietytoRNA[line['Variety']] = line["RNA"]
+    return GBStoVariety, RNAtoVariety, VarietytoRNA
+def cleanGBSname(name):
+    return name.split("/")[-1].split(".")[0]
+def get_genotype(genotype):
+    return genotype.split(":")[0]
+def convert_genotype(genotype):
+    if genotype=="./.": return "NA"
+    g1, g2 = genotype.split("/")
+    return str(int(g1)+int(g2))
+def collect_elements(elements, columns):
+    output_row = []
+    missing_counter = 0
+    for name in columns:
+        if name=="CHROM" or name=="POS":
+            output_row.append(elements[name])
+            continue
+        genotype = convert_genotype(get_genotype(elements[name]))
+        output_row.append(genotype)
+        if genotype=="NA":
+            missing_counter += 1
+    return output_row, missing_counter
+def contains_resequence(elements):
+    for element in elements:
+        if "A" in element:
+            return True
+    return False
+def coerce_as_list(x):
+    if type(x)==list:
+        return x
+    return [x]
+if __name__=="__main__":
+    usage = '''
+    usage: python \033[4m%prog\033[24m \033[38;5;74m[options]\033[39m \033[32m<vcf file 1> <vcf file 2>\033[39m'''
+    parser = OptionParser(usage)
+    parser.add_option('-o', type="string", nargs=1, dest="output", default="output.csv",
+                      help="Output file name. Default: output.csv")
+    parser.add_option('--ID', type="string", nargs=1, dest="IDmap",
+                      help="ID map file Default: IDmap.csv")
+    parser.add_option('--RNA', type="string", nargs=1, dest="RNA",
+                      help="RNA vcf file")
+    parser.add_option('--missingness', type="float", nargs=1, dest="Missingness", default="1",
+                      help="Percentage allowed missingness")
+    options, args = parser.parse_args()
+    IDmap = options.IDmap
+    RNA = options.RNA
+    output = options.output
+    missingness = options.Missingness
+    if IDmap==None: raise Exception("Please provide a IDmap file with --ID filename")
+    GBStoVariety, RNAtoVariety, VarietytoRNA = IDmap_read(IDmap)
+    #print(RNAtoVariety)
+    #print(VarietytoRNA)
+    #if GBS==None: raise Exception("Please provide a GBS vcf file with --GBS filename")
+    if RNA==None: raise Exception("Please provide a RNA vcf file with --RNA filename")
+    RNA_file = VCF(RNA)
+    print(RNA_file.individuals)
+    print(len(RNA_file.individuals))
+    replicate_counter = {}
+    new_individual_names = []
+    for rna_name, trans_name in zip(RNA_file.individuals, map(lambda x: RNAtoVariety.get(x, "SKIP"), RNA_file.individuals)):
+        if trans_name=="SKIP": continue
+        matchingnames = coerce_as_list(VarietytoRNA.get(trans_name))
+        #print(rna_name, trans_name,  matchingnames)
+        if len(matchingnames)>1:
+            if contains_resequence(matchingnames):
+                if "A" in rna_name:
+                    trans_name += "_reseq"
+                #print(rna_name, trans_name)
+                new_individual_names.append(trans_name)
+                i = RNA_file.header[rna_name]
+                RNA_file.revheader[i] = trans_name
+                del RNA_file.header[rna_name]
+                RNA_file.header[trans_name] = i
+                continue
+            else:
+                if trans_name not in replicate_counter:
+                    replicate_counter[trans_name] = 0
+                replicate_counter[trans_name] += 1
+                trans_name += "_rep{}".format(replicate_counter[trans_name])
+                #print(rna_name, trans_name)
+                new_individual_names.append(trans_name)
+                i = RNA_file.header[rna_name]
+                RNA_file.revheader[i] = trans_name
+                del RNA_file.header[rna_name]
+                RNA_file.header[trans_name] = i
+                continue
+        #if trans_name in new_individual_names:
+        #    continue
+        #print(rna_name, trans_name)
+        new_individual_names.append(trans_name)
+        i = RNA_file.header[rna_name]
+        RNA_file.revheader[i] = trans_name
+        del RNA_file.header[rna_name]
+        RNA_file.header[trans_name] = i
+    RNA_file.individuals = new_individual_names
+    #print(RNA_file.individuals)
+    #print(len(RNA_file.individuals))
+    missingness_cutoff = int(len(RNA_file.individuals)*missingness)
+    #print(missingness_cutoff)
+    ## Find common genotypes between files, and set order of VCF file.
+    name_columns = RNA_file.individuals
+    standard_columns = ["CHROM", "POS"]
+    output_column_names = ["chromosome", "position"]
+    columns = standard_columns+sorted(name_columns)
+    out_columns = output_column_names+sorted(name_columns)
+    print(columns)
+    out_file = open(output, "w")
+    out_file.write(",".join(out_columns))
+    out_file.write("\n")
+    ## Initialize file reading
+    RNAline = RNA_file.readline()
+    SNPs_removed = 0
+    SNPs_added = 0
+    ## Iteratively read RNA and GBS file in order of SNPs
+    while not RNA_file._empty:
+        elements, _ = RNAline
+        output_row, missing_counter = collect_elements(elements, columns)
+        if missing_counter>missingness_cutoff:
+            RNAline = RNA_file.readline()
+            SNPs_removed += 1
+            continue
+        out_file.write(",".join(output_row))
+        out_file.write("\n")
+        SNPs_added += 1
+        RNAline = RNA_file.readline()
+        if RNAline[0] is None: continue
+    out_file.close()
+    print("{} SNPs removed with missingness more than: {}%".format(SNPs_removed, missingness*100))
+    print("{} SNPs writen to file")
 ```
