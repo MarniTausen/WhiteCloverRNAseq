@@ -1,6 +1,6 @@
 White Clover RNAseq supplementary scripts
 ================
-02/10/2020 - 16:13:35
+02/10/2020 - 16:51:07
 
 -   [Introduction](#introduction)
 -   [RNA mapping and variant calling](#rna-mapping-and-variant-calling)
@@ -15,7 +15,13 @@ White Clover RNAseq supplementary scripts
 -   [VCF Utilities](#vcf-utilities)
     -   [VCF filter using reference individual](#vcf-filter-using-reference-individual)
     -   [VCF rename columns](#vcf-rename-columns)
+    -   [VCF Heterozygosity](#vcf-heterozygosity)
+    -   [VCF Depth](#vcf-depth)
+    -   [VCF Filter samples](#vcf-filter-samples)
+    -   [VCF info extraction](#vcf-info-extraction)
     -   [VCF to Genotype Matrix](#vcf-to-genotype-matrix)
+-   [Choose Genotypes out of Genotype Matrix](#choose-genotypes-out-of-genotype-matrix)
+    -   [Make GRM from Genotype Matrix](#make-grm-from-genotype-matrix)
 
 Introduction
 ============
@@ -806,6 +812,246 @@ if __name__=="__main__":
     out_file.close()
 ```
 
+VCF Heterozygosity
+------------------
+
+Counts the heterozygosity from the vcf file.
+
+``` python
+from VCF import VCF
+import argparse
+import sys
+def process_info(info):
+    info_elements = {}
+    for element in info.split(";"):
+        name, item = element.split("=")
+        info_elements[name] = item
+    return info_elements
+if __name__=="__main__":
+    parser = argparse.ArgumentParser(
+        usage="python VCFfilterByGenotypeFile.py <vcf_file> <filter_by_genotype_file.csv> > filtered_vcf_file.csv"
+    )
+    parser.add_argument('vcffile')
+    args = parser.parse_args(sys.argv[1:])
+    VCF_data = VCF(args.vcffile)
+    ## Initialize file reading
+    VCFline = VCF_data.readline()
+    individual_count = {}
+    for individual in VCF_data.individuals:
+        individual_count[individual] = {}
+    while not VCF_data._empty:
+        elements, _ = VCFline
+        for individual in VCF_data.individuals:
+            genotype = elements[individual].split(":")[0]
+            if genotype=="./.": continue
+            if genotype not in individual_count[individual]:
+                individual_count[individual][genotype] = 0
+            individual_count[individual][genotype] += 1
+        #sys.exit()
+        VCFline = VCF_data.readline()
+    #heterozyogisty_table = {}
+    print("individual,heterozygisty")
+    for individual in VCF_data.individuals:
+        het = individual_count[individual].get("0/1", 0)+individual_count[individual].get("1/0", 0)
+        hom = individual_count[individual].get("0/0", 0)+individual_count[individual].get("1/1", 0)
+        print("{},{}".format(individual,het/float(hom+het)))
+```
+
+VCF Depth
+---------
+
+Estimates the average read depth in a vcf file
+
+``` python
+from VCF import VCF
+import argparse
+import sys
+def process_info(info):
+    info_elements = {}
+    for element in info.split(";"):
+        name, item = element.split("=")
+        info_elements[name] = item
+    return info_elements
+if __name__=="__main__":
+    parser = argparse.ArgumentParser(
+        usage="python VCFfilterByGenotypeFile.py <vcf_file> <filter_by_genotype_file.csv> > filtered_vcf_file.csv"
+    )
+    parser.add_argument('vcffile')
+    args = parser.parse_args(sys.argv[1:])
+    VCF_data = VCF(args.vcffile)
+    ## Initialize file reading
+    VCFline = VCF_data.readline()
+    Depth = []
+    while not VCF_data._empty:
+        elements, line = VCFline
+        info_elements = process_info(elements["INFO"])
+        if "DP" in info_elements:
+            Depth.append(float(info_elements["DP"]))
+        VCFline = VCF_data.readline()
+    print(sum(Depth)/len(Depth))
+```
+
+VCF Filter samples
+------------------
+
+Provide a list of individuals and filter the individuals from the vcf file
+
+``` python
+from VCF import VCF
+import argparse
+import sys
+def read_filter_file(filename):
+    _file = open(filename)
+    items = set(["chromosome", "position"])
+    for line in _file:
+        items.add(line.replace("\n",""))
+    return items
+if __name__=="__main__":
+    parser = argparse.ArgumentParser(
+        usage="python VCFfilterByGenotypeFile.py <vcf_file> <filter_by_genotype_file.csv> > filtered_vcf_file.csv"
+    )
+    parser.add_argument('vcffile')
+    parser.add_argument('filterfile')
+    args = parser.parse_args(sys.argv[1:])
+    genotypes_to_keep = read_filter_file(args.filterfile)
+    VCF_data = VCF(args.vcffile, colnames=True)
+    for line in VCF_data.header_info.split("\n"):
+        if "fileformat" in line:
+            print("##fileformat=VCFv4.1")
+            continue
+        if "##"==line[:2]:
+            print(line)
+    #print(VCF_data.header_info, end="")
+    genotypes_list = []
+    for name  in VCF_data.individuals:
+        if name in genotypes_to_keep:
+            genotypes_list.append(name)
+    columns = ["CHROM", "POS", "ID", "REF", "ALT", "QUAL", "FILTER", "INFO", "FORMAT"]
+    output_columns = columns+genotypes_list
+    print("#"+"\t".join(output_columns))
+    ## Initialize file reading
+    VCFline = VCF_data.readline()
+    ## Iteratively every line in the RNA file
+    while not VCF_data._empty:
+        elements, line = VCFline
+        row = []
+        for out_col in output_columns:
+            row.append(elements[out_col])
+        print("\t".join(row))
+        VCFline = VCF_data.readline()
+```
+
+VCF info extraction
+-------------------
+
+Collect SNP statistics from the VCF file for quality control of the filtering
+
+``` python
+from VCF import VCF
+from optparse import OptionParser
+import sys
+def get_genotype(genotype):
+    return genotype.split(":")[0]
+def convert_genotype(genotype):
+    if genotype=="./.": return "NA"
+    g1, g2 = genotype.split("/")
+    return str(int(g1)+int(g2))
+def collect_elements(elements, columns):
+    output_row = []
+    missing_counter = 0
+    for name in columns:
+        if name=="CHROM" or name=="POS":
+            output_row.append(elements[name])
+            continue
+        genotype = convert_genotype(get_genotype(elements[name]))
+        output_row.append(genotype)
+        if genotype=="NA":
+            missing_counter += 1
+    return output_row, missing_counter
+def process_info(info):
+    info_elements = {}
+    for element in info.split(";"):
+        name, item = element.split("=")
+        info_elements[name] = item
+    return info_elements
+def process_header_for_info(header):
+    info_names = []
+    for line in header.split("\n"):
+        if "##INFO" in line:
+            name = line.split("=<")[-1].split(",")[0].split("=")[-1]
+            info_names.append(name)
+    return info_names
+if __name__=="__main__":
+    usage = '''
+    usage: python \033[4m%prog\033[24m \033[38;5;74m[options]\033[39m \033[32m<vcf file 1> <vcf file 2>\033[39m'''
+    parser = OptionParser(usage)
+    parser.add_option('-o', type="string", nargs=1, dest="output", default="output.csv",
+                      help="Output file name. Default: output.csv")
+    parser.add_option('--RNA', type="string", nargs=1, dest="RNA",
+                      help="RNA vcf file")
+    parser.add_option('--missingness', type="float", nargs=1, dest="Missingness", default="1",
+                      help="Percentage allowed missingness")
+    options, args = parser.parse_args()
+    RNA = options.RNA
+    output = options.output
+    missingness = options.Missingness
+    #if GBS==None: raise Exception("Please provide a GBS vcf file with --GBS filename")
+    if RNA==None: raise Exception("Please provide a RNA vcf file with --RNA filename")
+    RNA_file = VCF(RNA)
+    all_info_names = process_header_for_info(RNA_file.header_info)
+    ignore_list = set(['DS', 'END', 'HaplotypeScore', 'RAW_MQ'])
+    info_names = []
+    for name in all_info_names:
+        if name in ignore_list: continue
+        info_names.append(name)
+    print(info_names)
+    print(RNA_file.individuals)
+    print(len(RNA_file.individuals))
+    missingness_cutoff = int(len(RNA_file.individuals)*missingness)
+    print(missingness_cutoff)
+    ## Find common genotypes between files, and set order of VCF file.
+    name_columns = RNA_file.individuals
+    standard_columns = ["CHROM", "POS", "S9", "IS_SNP"]
+    genotype_list = set(["S9"])
+    info_list = set(info_names)
+    columns = standard_columns+sorted(info_names)
+    print(columns)
+    out_file = open(output, "w")
+    out_file.write(";".join(columns))
+    out_file.write("\n")
+    ## Initialize file reading
+    RNAline = RNA_file.readline()
+    #SNPs_removed = 0
+    #SNPs_added = 0
+    ## Mark INDELs and multi allelic sites
+    ## Iteratively read RNA and GBS file in order of SNPs
+    while not RNA_file._empty:
+        elements, _ = RNAline
+        info_elements = process_info(elements["INFO"])
+        output_row = []
+        for name in columns:
+            if name=="IS_SNP":
+                if len(elements["REF"])>1 or len(elements["ALT"])>1:
+                    output_row.append("False")
+                else:
+                    output_row.append("True")
+                continue
+            if name in genotype_list:
+                output_row.append(convert_genotype(get_genotype(elements[name])))
+            elif name in info_list:
+                output_row.append(info_elements.get(name, "NA"))
+            else:
+                output_row.append(elements[name])
+        out_file.write(";".join(output_row))
+        out_file.write("\n")
+        #SNPs_added += 1
+        RNAline = RNA_file.readline()
+        if RNAline[0] is None: continue
+    out_file.close()
+    #print("{} SNPs removed with missingness more than: {}%".format(SNPs_removed, missingness*100))
+    #print("{} SNPs writen to file")
+```
+
 VCF to Genotype Matrix
 ----------------------
 
@@ -963,4 +1209,99 @@ if __name__=="__main__":
     out_file.close()
     print("{} SNPs removed with missingness more than: {}%".format(SNPs_removed, missingness*100))
     print("{} SNPs writen to file")
+```
+
+Choose Genotypes out of Genotype Matrix
+=======================================
+
+Filter the Genotype Matrix, by choosing which genotypes should be kept
+
+``` python
+import argparse
+import sys
+def read_filter_file(filename):
+    _file = open(filename)
+    items = set(["chromosome", "position"])
+    for line in _file:
+        items.add(line.replace("\n",""))
+    return items
+if __name__=="__main__":
+    parser = argparse.ArgumentParser(
+        usage="python choose_genotypes.py <file_to_filter>.csv <file_to_filter_by>.txt > filtered_genotype_file"
+    )
+    parser.add_argument('genotypefile')
+    parser.add_argument('samples_file')
+    args = parser.parse_args(sys.argv[1:])
+    genotypes_to_keep = read_filter_file(args.samples_file)
+    #print(genotypes_to_keep)
+    _file = open(args.genotypefile)
+    header = _file.readline().replace("\n", "").split(",")
+    indices_to_keep = set()
+    for i, name in enumerate(header):
+        if name in genotypes_to_keep:
+            indices_to_keep.add(i)
+    filtered_header = []
+    for i, name in enumerate(header):
+        if i in indices_to_keep:
+            filtered_header.append(name.replace("_reseq","").replace("_rep1","").replace("_rep2", "").replace("_rep3",""))
+    print(','.join(filtered_header))
+    for line in _file:
+        line_info = line.replace("\n", "").split(",")
+        row = []
+        for i, element in enumerate(line_info):
+            if i in indices_to_keep:
+                row.append(element)
+        print(','.join(row))
+```
+
+Make GRM from Genotype Matrix
+-----------------------------
+
+Calculate GRM from the Genotype Matrix
+
+``` python
+import argparse
+import sys
+import numpy as np
+def load_as_matrix(filename):
+    _file = open(filename)
+    header = _file.readline().replace("\n", "").split(",")
+    names = header[2:]
+    rows = [list() for i in range(len(names))]
+    for line in _file:
+        line_info = line.replace("\n", "").split(",")
+        for i, element in enumerate(line_info[2:]):
+            if element=="NA":
+                rows[i].append(0)
+            else:
+                rows[i].append(int(element))
+    return names, np.array(rows)
+def replace_column_nans_by_mean(matrix):
+    # Set the value of gaps/dashes in each column to be the average of the other values in the column.
+    nan_indices = np.where(np.isnan(matrix))
+    # Note: bn.nanmean() instead of np.nanmean() because it is a lot(!) faster.
+    column_nanmeans = np.nanmean(matrix, axis=0)
+    matrix[nan_indices] = np.take(column_nanmeans, nan_indices[1])
+    return matrix
+def calcGRM(SNP):
+    N, M = SNP.shape
+    NORM = (SNP-np.mean(SNP, 0))/(np.std(SNP, 0)+0.000000000000001)
+    return np.dot(NORM, NORM.T)/M
+def save_GRM(GRM, names):
+    GRM = GRM.astype(str)
+    sys.stdout.write("names/names,"+",".join(names))
+    sys.stdout.write("\n")
+    for i, name in enumerate(names):
+        row = GRM[i,:].tolist()
+        sys.stdout.write("{},".format(name)+",".join(row))
+        sys.stdout.write("\n")
+if __name__=="__main__":
+    parser = argparse.ArgumentParser(
+        usage="python MakeGRM.py <genotypefile> <MAFlevel> > grm.csv"
+    )
+    parser.add_argument('genotypefile')
+    args = parser.parse_args(sys.argv[1:])
+    names, SNP = load_as_matrix(args.genotypefile)
+    GRM = calcGRM(SNP)
+    save_GRM(GRM, names)
 ```
